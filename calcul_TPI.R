@@ -4,8 +4,8 @@ outils <- obtenirOutils()
 
 outils$base$setNom <- "TPI"
 
-dossier <- "U:/Projets_2023/23-1042-DRF_Model_spat_temp_nerprun/02_Realisation/4_Traitements/03_propagation/test_tpi/tuiles_raster_MNT30"
-dossieEnregistrement <- "U:/Projets_2023/23-1042-DRF_Model_spat_temp_nerprun/02_Realisation/4_Traitements/03_propagation/test_tpi/resultats"
+dossier <- "D:/donnes_lidar_mnt_etc/donnees_mnt_30m"
+dossieEnregistrement <- "D:/donnes_lidar_mnt_etc/tpi_30m"
 
 listeRasters <- outils$lireListeFichierExt(dossier = dossier)
 
@@ -13,7 +13,7 @@ outils$base$setDossier <- dossieEnregistrement
 outils$base$setNom     <- "TPI_Nerprun"
 
 
-purrr::walk(listeRasters, function(chemin, scale = 7) {
+purrr::walk(listeRasters, function(chemin, scale = 5) {
     tryCatch(
         {
             monRaster            <- terra::rast(chemin)
@@ -21,7 +21,7 @@ purrr::walk(listeRasters, function(chemin, scale = 7) {
             resTPI <- spatialEco::tpi(monRaster, scale = scale)
             terra::writeRaster(resTPI, filename = cheminEnregistrement, overwrite = TRUE)
             message <- glue::glue("
-              \n=================================================================
+              /n=================================================================
               MNT Origine : {chemin}
               resolution: {terra::res(monRaster)}
               Fonction TIP: spatialEco::tpi
@@ -37,3 +37,5 @@ purrr::walk(listeRasters, function(chemin, scale = 7) {
         }
     )
 })
+
+
