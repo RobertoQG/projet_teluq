@@ -1,0 +1,421 @@
+---
+title: "main_analyse"
+author: "Roberto Quezada GArcia"
+date: "2026-07-25"
+output:
+  pdf_document: default
+  html_document: default
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## R Markdown
+**Analyse des données**
+Votre prénom et nom : Roberto Quezada Garcia/
+Votre numéro d'étudiant : 24120461/
+Trimestre d'inscription : été 2026/
+Date d'envoi : 26 juillet 2026/
+Direction github du projet : <https://github.com/RobertoQG/projet_teluq>
+```{r initialisation}
+source("classe_outils.R")
+library(magrittr)
+outils <- Outils$new()
+
+```
+## Chemin et importation des données
+```{r chemins, echo=FALSE}
+cheminRasterStack <- "./data/stackVariables.tif"
+cheminPoints <- "./data/pointsNerprun.csv"
+cheminMask   <- "./data/mask.tif"
+cheminssp245 <- "./data/stackVariables_ssp245.tif"
+cheminssp370 <- "./data/stackVariables_ssp370.tif"
+cheminssp585 <- "./data/stackVariables_ssp585.tif"
+
+
+monRaster <- terra::rast(cheminRasterStack)
+monMask <- terra::rast(cheminMask)
+mesPoints <- readr::read_csv(cheminPoints)
+mesPoints <- as.data.frame(mesPoints)
+```
+```{r dataFrame, echo=FALSE}
+head(mesPoints)
+```
+
+## Préparation des données et analyse des modèles
+Cette étape vise à préparer un jeu de données tabulaire unique,
+combinant les points de présence/absence du nerprun et les valeurs
+des variables environnementales correspondantes, afin de pouvoir
+entraîner rapidement les quatre modèles (RF, GLM, SVM, GAM)
+pour chacun d'eux. Une fois les performances des modèles obtenues, seul le meilleur modèle sera
+ensuite utilisé pour produire la carte de prédiction finale.
+
+Les principales étapes de préparation sont les suivantes :
+
+- **Extraction des valeurs environnementales** (`terra::extract`) :
+  les valeurs des variables du raster sont extraites aux coordonnées
+  (x, y) de chaque point d'occurrence, afin d'associer à chaque
+  observation de présence/absence ses conditions environnementales
+  locales.
+
+- **Retrait des valeurs manquantes** (`complete.cases`) : les points
+  situés en dehors de l'étendue du raster, ou pour lesquels une ou
+  plusieurs variables environnementales sont manquantes (NA), sont
+  exclus afin d'éviter des erreurs lors de l'entraînement des modèles.
+
+- **Construction de la formule du modèle** : la formule est générée
+  dynamiquement à partir des noms des couches du raster
+  (`names(monRaster)`), ce qui rend le code flexible advenant un ajout
+  ou un retrait de variables environnementales dans le stack, sans
+  devoir modifier manuellement la formule.
+
+- **Séparation entraînement/test (split 70/30)** : les données sont
+  divisées aléatoirement en un jeu d'entraînement (70 %) et un jeu de
+  test (30 %), avec une valeur fixe (`set.seed(42)`) pour assurer la
+  reproductibilité des résultats. Le jeu de test, indépendant de
+  l'entraînement, permet d'évaluer la performance réelle de chaque
+  modèle sur des données qu'il n'a jamais vues, plutôt que de mesurer
+  uniquement sa capacité à s'ajuster aux données d'entraînement.
+
+- **Fonction de mesure du temps d'exécution** (`mesureTemps`) : chaque
+  algorithme est entraîné à l'aide de cette fonction décoratrice, ce
+  qui permet de documenter et comparer le temps de calcul requis par
+  chaque approche, un critère pertinent lorsque plusieurs modèles
+  doivent être testés de façon répétée.
+
+
+
+```{r preparation_donnees, echo=TRUE}
+set.seed(42)
+valeursEnv <- terra::extract(monRaster, mesPoints[, c("x", "y")])
+donneesModele <- cbind(mesPoints, valeursEnv[, -1])
+donneesModele <- donneesModele[complete.cases(donneesModele), ]
+
+variablesEnv <- names(monRaster)
+formule <- as.formula(paste("pres ~", paste(variablesEnv, collapse = " + ")))
+
+
+indexEntrainement <- sample(seq_len(nrow(donneesModele)), size = 0.7 * nrow(donneesModele))
+entrainement <- donneesModele[indexEntrainement, ]
+test <- donneesModele[-indexEntrainement, ]
+
+mesureTemps <- outils$mesureTempsDeco
+
+```
+## Fonction pour calculer les métriques des modèles
+
+Afin de comparer objectivement la performance des quatre modèles, une
+fonction générique a été développée pour calculer un ensemble de
+métriques d'évaluation complémentaires plutôt que de se fier à une
+seule mesure. Chaque métrique apporte une information différente sur
+la qualité du modèle :
+
+- **AUC (Area Under the Curve)** : mesure la capacité globale du
+  modèle à discriminer les présences des absences, indépendamment
+  d'un seuil de classification. C'est une métrique standard et
+  largement utilisée en modélisation de distribution d'espèces,
+  puisqu'elle évalue la qualité du classement des probabilités
+  prédites plutôt qu'une classification binaire arbitraire.
+
+- **Seuil optimal (méthode de Youden)** : les modèles produisent une
+  probabilité continue de présence, qu'il faut convertir en prédiction
+  binaire (présence/absence) pour calculer plusieurs des métriques
+  suivantes. La méthode de Youden a été choisie car elle sélectionne
+  le seuil qui maximise simultanément la sensibilité et la
+  spécificité, ce qui correspond directement à la maximisation du TSS
+
+
+- **Sensibilité et spécificité** : évaluent respectivement la capacité
+  du modèle à bien détecter les présences réelles (éviter les faux
+  négatifs) et les absences réelles (éviter les faux positifs). Ces
+  deux métriques sont essentielles en écologie, car un modèle peut
+  afficher une bonne précision globale tout en étant biaisé vers une
+  seule classe si les données sont déséquilibrées.
+
+- **TSS (True Skill Statistic)** : combine sensibilité et spécificité
+  en une seule valeur (sensibilité + spécificité − 1). Le TSS est
+  privilégié en modélisation de distribution d'espèces car,
+  contrairement au Kappa, il n'est pas influencé par la prévalence
+  (le ratio présence/absence) des données, ce qui le rend plus fiable
+  pour comparer des modèles entre eux.
+
+- **Kappa de Cohen** : mesure l'accord entre les prédictions et les
+  observations en corrigeant pour l'accord attendu par le simple
+  hasard. Il complète le TSS en offrant une autre perspective sur la
+  fiabilité des prédictions binaires du modèle.
+
+- **Précision globale** : indique simplement la proportion totale de
+  prédictions correctes (présences et absences confondues). Bien que
+  facile à interpréter, cette métrique est incluse à titre indicatif
+  seulement, car elle peut être trompeuse si les classes sont
+  déséquilibrées — d'où l'importance de l'analyser conjointement avec
+  la sensibilité, la spécificité et le TSS.
+
+Cette fonction a été construite comme une alternative rapide aux
+métriques d'évaluation calculées automatiquement
+
+```{r fonctions_metriques, echo=TRUE}
+
+
+calculerMetriques <- function(predictions, observations) {
+  roc_obj <- pROC::roc(observations, predictions, quiet = TRUE)
+
+  # Seuil optimal selon Youden (= max de TSS = sensibilité + spécificité - 1)
+  meilleurSeuil <- pROC::coords(roc_obj, "best", best.method = "youden",
+                                 ret = c("threshold", "sensitivity", "specificity"))
+
+  sensibilite <- meilleurSeuil$sensitivity
+  specificite <- meilleurSeuil$specificity
+  tss <- sensibilite + specificite - 1
+
+  predBinaire <- ifelse(predictions >= meilleurSeuil$threshold, 1, 0)
+
+  matriceConf <- table(
+    Observe = factor(observations, levels = c(0, 1)),
+    Predit  = factor(predBinaire, levels = c(0, 1))
+  )
+
+  vp <- matriceConf["1", "1"]
+  vn <- matriceConf["0", "0"]
+  fp <- matriceConf["0", "1"]
+  fn <- matriceConf["1", "0"]
+
+  n <- vp + vn + fp + fn
+  accord_observe <- (vp + vn) / n
+  accord_hasard <- ((vp + fp) * (vp + fn) + (fn + vn) * (fp + vn)) / n^2
+  kappa <- (accord_observe - accord_hasard) / (1 - accord_hasard)
+
+  data.frame(
+    AUC = as.numeric(roc_obj$auc),
+    seuil = as.numeric(meilleurSeuil$threshold),
+    sensibilite = sensibilite,
+    specificite = specificite,
+    TSS = tss,
+    Kappa = kappa,
+    precision_globale = accord_observe
+  )
+}
+```
+
+## Performance des modèles
+
+Afin de prédire la probabilité de présence du nerprun (*nerprun bourdaine*),
+quatre algorithmes de modélisation de la distribution
+d'espèces ont été comparés : Random Forest, GLM, SVM et GAM. Ces
+quatre approches ont été retenues car elles reposent sur des
+hypothèses statistiques différentes (linéaire, non linéaire,
+paramétrique, non paramétrique) et sont couramment utilisées en
+modélisation de niche écologique, ce qui permet de comparer leurs
+performances et de sélectionner celle qui capte le mieux la relation
+entre les variables environnementales et la présence de l'espèce.
+
+### Random Forest
+
+Le Random Forest a été choisi pour sa capacité à modéliser des
+relations non linéaires et des interactions complexes entre variables
+environnementales sans devoir les spécifier a priori. Il est aussi
+robuste face au surapprentissage grâce à l'agrégation de multiples
+arbres de décision, et peu sensible à la présence de
+variables corrélées ou peu informatives.
+
+```{r modele_RF, echo=TRUE}
+entrainementRF <- entrainement
+entrainementRF$pres <- as.factor(entrainementRF$pres)
+
+
+rfModele <- mesureTemps(randomForest::randomForest)(formule, data = entrainementRF)
+predRF <- predict(rfModele, newdata = test, type = "prob")[, "1"]
+```
+
+### Modèle linéaire généralisé (GLM)
+
+Le GLM a été inclus comme modèle de référence classique en
+modélisation de distribution d'espèces. Sa simplicité et son
+interprétabilité (coefficients associés à chaque variable) en font un
+bon point de comparaison pour évaluer si les relations entre les
+variables environnementales et la présence du nerprun sont
+essentiellement linéaires, ou si des approches plus flexibles comme le
+Random Forest ou le GAM apportent un gain de performance réel.
+
+```{r modele_GLM, echo=TRUE}
+glmModele <- mesureTemps(stats::glm)(formule, data = entrainement, family = binomial)
+predGLM <- predict(glmModele, newdata = test, type = "response")
+```
+
+### Machine à vecteurs de support (SVM)
+Le SVM a été retenu pour sa capacité à séparer efficacement les
+classes (présence/absence) même lorsque la frontière de décision est
+complexe et non linéaire, grâce à l'utilisation de noyaux. Cet
+algorithme performe généralement bien avec un nombre modéré
+d'observations et de variables, ce qui correspond au contexte de ce
+jeu de données.
+
+```{r modele_SVM, echo=TRUE}
+entrainementSVM <- entrainement
+entrainementSVM$pres <- as.factor(entrainementSVM$pres)
+
+svmModele <- mesureTemps(e1071::svm)(formule, data = entrainementSVM, probability = TRUE)
+predSVM <- attr(predict(svmModele, newdata = test, probability = TRUE), "probabilities")[, "1"]
+```
+
+### Modèle additif généralisé (GAM)
+
+Le GAM a été choisi comme intermédiaire entre le GLM et le Random
+Forest : il permet de modéliser des relations non linéaires entre
+chaque variable environnementale et la probabilité de présence (via
+des fonctions de lissage), tout en conservant une structure additive
+plus interprétable qu'un modèle de type "boîte noire" comme le Random
+Forest ou le SVM. C'est une approche fréquemment utilisée en écologie
+pour ce type de compromis entre flexibilité et interprétabilité.
+
+```{r modele_GAM, echo=TRUE}
+formuleGAM <- as.formula(paste("pres ~", paste0("s(", variablesEnv, ")", collapse = " + ")))
+gamModele <- mesureTemps(mgcv::gam)(formuleGAM, data = entrainement, family = binomial)
+predGAM <- predict(gamModele, newdata = test, type = "response")
+```
+
+## Comparaison des modèles
+
+Les performances de ces quatre modèles sont comparées dans la section
+suivante à l'aide de plusieurs métriques d'évaluation (AUC, TSS,
+Kappa, sensibilité, spécificité et précision globale), afin de
+sélectionner objectivement le modèle le plus performant pour prédire
+la probabilité de présence du nerprun.
+
+On regroupe les métriques d'évaluation (AUC, Kappa, sensibilité,
+spécificité, seuil, TSS, etc.) de chaque modèle dans un seul tableau,
+pour pouvoir les comparer facilement.
+
+```{r comparaison_modeles, echo=TRUE}
+metriquesRF  <- calculerMetriques(predRF,  test$pres)
+metriquesGLM <- calculerMetriques(predGLM, test$pres)
+metriquesSVM <- calculerMetriques(predSVM, test$pres)
+metriquesGAM <- calculerMetriques(predGAM, test$pres)
+
+tableauComparatif <- do.call(rbind, list(
+  cbind(modele = "RF",  metriquesRF),
+  cbind(modele = "GLM", metriquesGLM),
+  cbind(modele = "SVM", metriquesSVM),
+  cbind(modele = "GAM", metriquesGAM)
+))
+
+knitr::kable(tableauComparatif, digits = 3, caption = "Comparaison des modèles SDM")
+```
+
+| Modèle | AUC       | Seuil     | Sensibilité | Spécificité | TSS       | Kappa     | Précision globale |
+|--------|-----------|-----------|-------------|-------------|-----------|-----------|--------------------|
+| RF     | 0.9996781 | 0.1280000 | 0.9963340   | 0.9935342   | 0.9898682 | 0.9752495 | 0.9939279          |
+| GLM    | 0.9845079 | 0.2823145 | 0.9865580   | 0.9622050   | 0.9487631 | 0.8696589 | 0.9656298          |
+| SVM    | 0.9955937 | 0.2463525 | 0.9828921   | 0.9888015   | 0.9716936 | 0.9512768 | 0.9879704          |
+| GAM    | 0.9982133 | 0.1948273 | 0.9873727   | 0.9842021   | 0.9715748 | 0.9386385 | 0.9846480          |
+
+**Meilleur modèle : RF** — il obtient les meilleurs scores sur
+l'ensemble des métriques (AUC, TSS, Kappa, précision globale,
+sensibilité et spécificité), ce qui en fait le choix le plus
+performant pour cette analyse.
+
+## Sélection et ajustement final du meilleur
+
+On roule  une seule fois, uniquement pour le
+meilleur modèle identifié ci-dessus, afin d'obtenir un objet SSDM
+complet (utile pour la projection et la visualisation standard du
+package).
+
+```{r meilleur_modele, echo=TRUE}
+nomMeilleurModele <- tableauComparatif$modele[which.max(tableauComparatif$AUC)]
+cat("Le meilleur modèle est :", nomMeilleurModele, "/n")
+cat("AUC =", max(tableauComparatif$AUC), "/n")
+
+```
+
+## Prédiction de la carte de distribution prédite
+```{r carte, echo=FALSE}
+monModele <- terra::predict(monRaster, rfModele, type = "prob", index = 2)
+monModele <- terra::mask(monModele, monMask)
+enregistrement <- "D:/Teluq_project/projet_finale_teluq/projet_teluq/resultat/predPresentNerprun.tif"
+
+terra::writeRaster(monModele, filename = enregistrement, overwrite = TRUE)
+
+library(ggplot2)
+library(tidyterra)
+
+# Visualisation -----------------------------------------------------------------
+ggplot() +
+  geom_spatraster(data = monModele) +
+  scale_fill_whitebox_c(
+    palette = "muted",
+    na.value = "white") + 
+  labs(title = "Prédiction actuelle du nerprun bourdaine au Québec", 
+       subtitle = "Probabilité de présence",
+       fill = "probabilité") +
+  theme_classic() 
+```
+
+## Prediction pour le future avec les trois scenarios
+Les projections climatiques futures utilisées pour cette analyse proviennent des données 
+d'Ouranos, le consortium de référence en scénarios climatiques régionalisés pour le Québec. 
+Trois scénarios socio-économiques partagés (SSP) sont considérés afin de représenter un 
+gradient de trajectoires d'émissions de gaz à effet de serre : SSP245 (émissions modérées), 
+SSP370 (émissions élevées) et SSP585 (émissions très élevées, scénario le plus pessimiste). 
+Ces trois scénarios permettent d'évaluer la sensibilité de la répartition potentielle du 
+nerprun bourdaine à différentes intensités de changements climatiques.
+
+
+```{r carteFuture, echo=FALSE}
+
+
+# Lecture des rasters futurs -------------------------------------------------
+monRaster245 <- terra::rast(cheminssp245)
+monRaster370 <- terra::rast(cheminssp370)
+monRaster585 <- terra::rast(cheminssp585)
+
+# Prédictions -----------------------------------------------------------------
+monRaster245pred <- terra::predict(monRaster245, rfModele, type = "prob", index = 2)
+monRaster245pred <- terra::mask(monRaster245pred, monMask)
+
+monRaster370pred <- terra::predict(monRaster370, rfModele, type = "prob", index = 2)
+monRaster370pred <- terra::mask(monRaster370pred, monMask)
+
+monRaster585pred <- terra::predict(monRaster585, rfModele, type = "prob", index = 2)
+monRaster585pred <- terra::mask(monRaster585pred, monMask)
+
+# Enregistrement des prédictions -----------------------------------------------
+terra::writeRaster(monRaster245pred, filename = "./resultat/pred_245_Nerprun.tif", overwrite = TRUE)
+terra::writeRaster(monRaster370pred, filename = "./resultat/pred_370_Nerprun.tif", overwrite = TRUE)
+terra::writeRaster(monRaster585pred, filename = "./resultat/pred_585_Nerprun.tif", overwrite = TRUE)
+
+
+# Visualisation -----------------------------------------------------------------
+ggplot() +
+  geom_spatraster(data = monRaster245pred) +
+  scale_fill_whitebox_c(
+    palette = "muted",
+    na.value = "white") +
+  labs(title = "Prédiction future du nerprun bourdaine au Québec (SSP245)",
+       subtitle = "Probabilité de présence",
+       fill = "probabilité") +
+  theme_classic()
+
+ggplot() +
+  geom_spatraster(data = monRaster370pred) +
+  scale_fill_whitebox_c(
+    palette = "muted",
+    na.value = "white") +
+  labs(title = "Prédiction future du nerprun bourdaine au Québec (SSP370)",
+       subtitle = "Probabilité de présence",
+       fill = "probabilité") +
+  theme_classic()
+
+ggplot() +
+  geom_spatraster(data = monRaster585pred) +
+  scale_fill_whitebox_c(
+    palette = "muted",
+    na.value = "white") +
+  labs(title = "Prédiction future du nerprun bourdaine au Québec (SSP585)",
+       subtitle = "Probabilité de présence",
+       fill = "probabilité") +
+  theme_classic()
+
+```
