@@ -3,8 +3,8 @@ title: "main_analyse"
 author: "Roberto Quezada GArcia"
 date: "2026-07-25"
 output:
-  pdf_document: default
   html_document: default
+  pdf_document: default
 editor_options: 
   markdown: 
     wrap: 72
